@@ -212,9 +212,11 @@ This project is MIT licensed. See [LICENSE](LICENSE).
 
 It depends on [pynput](https://github.com/moses-palmer/pynput), which is **LGPL v3**. pynput is installed separately by pip and is not included in this repository, so the MIT licence here covers this project's own code. If you redistribute a bundle that contains pynput itself, read the LGPL terms first.
 
-## A note on two macOS quirks, for anyone reading the code
+## A note on three macOS quirks, for anyone reading the code
 
-Both cost real debugging time and are commented in the source:
+All three cost real debugging time, all three are commented in the source, and
+each one was found by a test rather than by reading the code:
 
 1. **Start the pynput listeners before creating the Tk root.** pynput installs a CGEventTap and spins a CFRunLoop. If Tk initialises the main run loop first, the process dies with `SIGABRT` and prints no traceback whatsoever. Measured on macOS 26.4.1 with Tk 8.5: Tk first aborted 3 runs out of 3, listeners first survived every time.
 2. **Resolve `AXIsProcessTrusted` once before starting both listeners.** pyobjc resolves that symbol lazily with an unguarded `funcmap.pop(name)`. Starting the keyboard and mouse listeners in the same instant makes both threads race for it, and the loser dies with `KeyError: 'AXIsProcessTrusted'`, silently taking the hotkeys with it.
+3. **Move the cursor early, press on schedule, and never re-assign the position just before the press.** macOS stamps a click with the cursor position it has already committed. Setting the position and pressing immediately makes every click land on the *previous* target, quietly shifting the whole sequence by one step, which looks like scrambled output rather than a timing bug. Playback therefore parks the cursor `MOVE_SETTLE_MS` ahead of each click and presses exactly on time, so correctness costs no timing accuracy. The first move of a run needs a longer settle than the rest, because the first cursor move in a process also pays for lazy symbol resolution; warming that path took worst-case replay error from about 26 ms down to under 4 ms.

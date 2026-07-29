@@ -107,9 +107,18 @@ def safe_points(rect):
 # --- capture ----------------------------------------------------------------
 
 class Capture:
-    """Listens and timestamps what actually happened on the machine."""
+    """
+    Listens and timestamps what actually happened on the machine.
 
-    def __init__(self):
+    If a rect is given, clicks outside it are dropped. Every click this suite
+    makes lands inside the safe target window, so anything outside it is the
+    human using their own Mac, not test signal. A replayed click that landed
+    outside the window would show up as a MISSING click and still fail, so
+    this filters noise without hiding a real defect.
+    """
+
+    def __init__(self, rect=None):
+        self.rect = rect
         self.events = []
         self.lock = threading.Lock()
         self.t0 = None
@@ -146,6 +155,11 @@ class Capture:
     def _click(self, x, y, button, pressed):
         if not pressed:
             return
+        if self.rect is not None:
+            r = self.rect
+            if not (r["left"] <= x <= r["left"] + r["width"]
+                    and r["top"] <= y <= r["top"] + r["height"]):
+                return          # a real human click, not ours
         self._stamp({"type": "click", "x": int(x), "y": int(y),
                      "button": button.name})
 
@@ -262,7 +276,7 @@ def proof_roundtrip():
               % (not hotkeys_leaked))
 
         # --- replay leg
-        cap = Capture()
+        cap = Capture(rect)
         cap.start()
         play = Proc(["play", "proof_seq"], "play")
         time.sleep(BOOT_SECONDS)
@@ -285,6 +299,9 @@ def proof_roundtrip():
                   and all(a["key"] == b.get("name")
                           for a, b in zip(rep_keys, rec_keys)))
         print("   replayed click positions match recorded: %s" % pos_ok)
+        if not pos_ok:
+            print("      recorded: %s" % [(c["x"], c["y"]) for c in rec_clicks])
+            print("      replayed: %s" % [(c["x"], c["y"]) for c in rep_clicks])
         print("   replayed key order matches recorded:     %s" % key_ok)
 
         # --- timing
@@ -300,8 +317,18 @@ def proof_roundtrip():
         if jitter:
             print("   timing error vs recorded timestamps, %d samples:"
                   % len(jitter))
-            print("      median %.2f ms   worst %.2f ms"
+            print("      cumulative-from-first: median %.2f ms  worst %.2f ms"
                   % (statistics.median(jitter), max(jitter)))
+            gaps = []
+            for i in range(1, len(replayed)):
+                want = (press_recorded[i]["t"] - press_recorded[i-1]["t"]) * 1000
+                got = (replayed[i]["t"] - replayed[i-1]["t"]) * 1000
+                gaps.append(abs(got - want))
+            if gaps:
+                print("      per-step gap error:    median %.2f ms  worst %.2f ms"
+                      % (statistics.median(gaps), max(gaps)))
+            print("      per-sample cumulative: %s"
+                  % ["%.1f" % j for j in jitter])
         else:
             print("   timing: not comparable, replay count %d vs recorded %d"
                   % (len(replayed), len(press_recorded)))

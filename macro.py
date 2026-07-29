@@ -41,11 +41,16 @@ HOTKEY_AUTOCLICK = keyboard.Key.f8     # start / stop autoclicker
 #       Recordings get much bigger and replay is more sensitive to timing.
 CAPTURE_MOUSE_MOVES = False
 
-# Milliseconds to wait after moving the cursor before pressing the button.
-# 0 is correct for accurate timing and works for normal apps. Some games only
-# register a click if the cursor has settled first; if clicks get dropped in
-# game, try 8 or 15.
-MOVE_SETTLE_MS = 0
+# Milliseconds the cursor is given to settle at its new position before the
+# button is pressed. This does NOT cost you timing accuracy: playback moves
+# the cursor this far AHEAD of schedule and still presses exactly on time.
+#
+# Do not set this to 0. macOS stamps a press with the cursor position it has
+# already committed, so pressing immediately after setting the position makes
+# every click land on the PREVIOUS target, silently shifting the whole
+# sequence by one step. Measured on macOS 26.4.1: 0 ms and 5 ms both produced
+# shifted clicks, 10 ms was correct. Raise it if clicks still land wrong.
+MOVE_SETTLE_MS = 10
 
 # How often the playback loop wakes up to check whether you pressed stop.
 # Lower means the stop hotkey reacts faster, at slightly more idle CPU.
@@ -389,15 +394,44 @@ class MacroTool:
     def playback_loop(self, events):
         base = events[0]["t"]
         done = 0
+        lead = MOVE_SETTLE_MS / 1000.0
+        # Warm the injection path before anything is timed. The FIRST cursor
+        # move in a process resolves pyobjc symbols lazily and can take longer
+        # than the settle window, which made the first click of a run land on
+        # whatever the cursor was on before playback started. Every later click
+        # was fine, which is what gave it away.
+        try:
+            self.mouse_ctl.position = self.mouse_ctl.position
+            first = next((e for e in events if "x" in e and "y" in e), None)
+            if first is not None and lead:
+                # Park on the first target and give it a generous settle. The
+                # warm-up above is not enough on its own: the opening click of
+                # a run still landed on the previous cursor position often
+                # enough to matter, because one lead is a thin margin for the
+                # very first move. Later clicks are already parked by the loop.
+                self.mouse_ctl.position = (first["x"], first["y"])
+                time.sleep(max(lead, 0.05))
+        except Exception:
+            pass
         try:
             while not self.stop_flag.is_set():
                 self.loop_current = done + 1
-                start = time.perf_counter()
+                # start in the future by one lead, so even the first event
+                # gets its settle window without arriving late.
+                start = time.perf_counter() + lead
                 for ev in events:
                     target = start + (ev["t"] - base) / self.speed
+                    if lead and ev["type"] in ("click", "scroll"):
+                        # park the cursor early, then press exactly on time
+                        if not self.sleep_until(target - lead):
+                            return
+                        self.mouse_ctl.position = (ev["x"], ev["y"])
+                        parked = True
+                    else:
+                        parked = False
                     if not self.sleep_until(target):
                         return
-                    self.inject(ev)
+                    self.inject(ev, parked=parked)
                 done += 1
                 if self.loops != 0 and done >= self.loops:
                     break
@@ -422,21 +456,27 @@ class MacroTool:
                 time.sleep(min(remaining - SPIN_SECONDS, STOP_POLL_SECONDS))
             # else: fall through and spin, re-checking stop each pass
 
-    def inject(self, ev):
+    def inject(self, ev, parked=False):
+        """
+        parked=True means playback_loop already moved the cursor there and
+        waited. Do NOT set the position again: re-assigning it immediately
+        before the press is exactly what makes macOS stamp the event with the
+        old location, which shifts the click back onto the previous target.
+        """
         kind = ev["type"]
         if kind == "move":
             self.mouse_ctl.position = (ev["x"], ev["y"])
         elif kind == "click":
-            self.mouse_ctl.position = (ev["x"], ev["y"])
-            if MOVE_SETTLE_MS:
-                time.sleep(MOVE_SETTLE_MS / 1000.0)
+            if not parked:
+                self.mouse_ctl.position = (ev["x"], ev["y"])
             button = getattr(mouse.Button, ev["button"])
             if ev["pressed"]:
                 self.mouse_ctl.press(button)
             else:
                 self.mouse_ctl.release(button)
         elif kind == "scroll":
-            self.mouse_ctl.position = (ev["x"], ev["y"])
+            if not parked:
+                self.mouse_ctl.position = (ev["x"], ev["y"])
             self.mouse_ctl.scroll(ev["dx"], ev["dy"])
         elif kind == "key":
             self.note_synthetic(token_from_json(ev))
