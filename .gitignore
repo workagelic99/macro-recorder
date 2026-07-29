@@ -1,0 +1,9 @@
+# private python install
+.venv/
+
+# your own recordings, these are personal and stay local
+recordings/
+
+__pycache__/
+*.py[cod]
+.DS_Store
