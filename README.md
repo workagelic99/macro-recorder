@@ -15,7 +15,7 @@ There is a window with buttons, and a command line, and they both do the same th
 ## Requirements
 
 - A Mac
-- Python 3 with Tk, which Apple already ships at `/usr/bin/python3`. The install steps below use it on purpose. Homebrew's Python usually has no Tk, and the window will not open on it.
+- Any Python 3. The window is built with macOS's own Cocoa toolkit through pyobjc, which pip installs automatically as part of pynput, so there is nothing else to set up.
 
 ## Install
 
@@ -24,7 +24,7 @@ Open **Terminal** (press `Cmd+Space`, type `Terminal`, press Return) and paste t
 ```
 git clone https://github.com/workagelic99/macro-recorder.git
 cd macro-recorder
-/usr/bin/python3 -m venv .venv
+python3 -m venv .venv
 ./.venv/bin/python -m pip install pynput
 ```
 
@@ -174,7 +174,7 @@ Other things worth knowing:
 ```
 macro-recorder/
   macro.py        the engine plus the command line
-  gui.py          the window, a front end over the same engine
+  gui.py          the window (Cocoa via pyobjc), a front end over the same engine
   tests/          self-driving proof scripts
   recordings/     your saved sequences, one JSON file each (not committed)
   .venv/          the private Python install (not committed)
@@ -185,8 +185,6 @@ macro-recorder/
 **Nothing gets recorded and F6 does nothing.** The permissions are not actually live. Check both switches are ON, and make sure you quit Terminal with `Cmd+Q` and opened it again.
 
 **It refuses to start and mentions a listener dying.** Same cause: Input Monitoring is not granted, or Terminal was not restarted after granting it.
-
-**The window will not open, and you see an error about `_tkinter`.** You built the virtual environment with a Python that has no Tk. Delete the `.venv` folder and build it again with `/usr/bin/python3` as shown in the install steps.
 
 **F6 changes screen brightness.** See the fn key note above.
 
@@ -217,6 +215,6 @@ It depends on [pynput](https://github.com/moses-palmer/pynput), which is **LGPL 
 All three cost real debugging time, all three are commented in the source, and
 each one was found by a test rather than by reading the code:
 
-1. **Start the pynput listeners before creating the Tk root.** pynput installs a CGEventTap and spins a CFRunLoop. If Tk initialises the main run loop first, the process dies with `SIGABRT` and prints no traceback whatsoever. Measured on macOS 26.4.1 with Tk 8.5: Tk first aborted 3 runs out of 3, listeners first survived every time.
+1. **The window is Cocoa, not tkinter, and that was not a style choice.** tkinter was built first and abandoned on evidence. The only Python on macOS that ships Tk is Apple's `/usr/bin/python3`, carrying Tk 8.5.9 from 2010, which macOS itself marks deprecated. On macOS 26.4 that Tk lays every widget out correctly and reports all of them mapped and viewable, then draws none of them: the window opens at the right size with the right title and stays empty grey. It is not an interaction with pynput. Measured both ways, a window with no pynput anywhere in the process and a window with the listeners started first both mapped 5 of 5 children, identically. pyobjc is already required by pynput on macOS, so Cocoa costs no extra dependency and it draws. A related trap while Tk was still in play: starting the listeners after creating the Tk root aborted the process with `SIGABRT` and no traceback, 3 runs out of 3.
 2. **Resolve `AXIsProcessTrusted` once before starting both listeners.** pyobjc resolves that symbol lazily with an unguarded `funcmap.pop(name)`. Starting the keyboard and mouse listeners in the same instant makes both threads race for it, and the loser dies with `KeyError: 'AXIsProcessTrusted'`, silently taking the hotkeys with it.
 3. **Move the cursor early, press on schedule, and never re-assign the position just before the press.** macOS stamps a click with the cursor position it has already committed. Setting the position and pressing immediately makes every click land on the *previous* target, quietly shifting the whole sequence by one step, which looks like scrambled output rather than a timing bug. Playback therefore parks the cursor `MOVE_SETTLE_MS` ahead of each click and presses exactly on time, so correctness costs no timing accuracy. The first move of a run needs a longer settle than the rest, because the first cursor move in a process also pays for lazy symbol resolution; warming that path took worst-case replay error from about 26 ms down to under 4 ms.
