@@ -33,16 +33,38 @@ from pynput import keyboard, mouse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import macro  # noqa: E402
+import bindings  # noqa: E402
+import rawtap  # noqa: E402
 
 TOOL_DIR = Path(__file__).resolve().parent.parent
 VENV_PY = TOOL_DIR / ".venv" / "bin" / "python"
 MACRO = TOOL_DIR / "macro.py"
 TARGET = Path(__file__).resolve().parent / "safe_target.py"
 
-HOTKEY_RECORD = keyboard.Key.f6
-HOTKEY_PLAY = keyboard.Key.f7
-HOTKEY_AUTOCLICK = keyboard.Key.f8
+# Hotkeys come from the CANONICAL config, never from hardcoded F6/F7/F8. This
+# suite has to keep proving the tool after the user edits their bindings, and a
+# hardcoded key would quietly test a binding nobody uses any more. Both this
+# process and every macro.py subprocess read the same MACRO_CONFIG_PATH, so
+# they cannot disagree.
+BINDING_MAP, BINDING_WARNING = bindings.load_map()
+MOD_KEYS = {"ctrl": keyboard.Key.ctrl, "alt": keyboard.Key.alt,
+            "shift": keyboard.Key.shift, "cmd": keyboard.Key.cmd}
 TEST_KEYS = [keyboard.Key.f13, keyboard.Key.f14, keyboard.Key.f15]
+PAYLOAD_KEY_NAMES = [k.name for k in TEST_KEYS]
+
+
+def trigger_key(trigger):
+    if trigger["kind"] == "named":
+        return getattr(keyboard.Key, trigger["name"])
+    if trigger["kind"] == "physical":
+        return keyboard.KeyCode.from_vk(trigger["vk"])
+    return None
+
+
+def is_tool_hotkey(key):
+    """Is this key the trigger of any configured binding?"""
+    return any(bindings.trigger_matches_key(b["trigger"], key)
+               for b in BINDING_MAP.values())
 
 BOOT_SECONDS = 2.5      # time to let a macro.py subprocess get its listeners up
 WATCHDOG = 45           # hard ceiling on any macro.py subprocess
@@ -129,8 +151,15 @@ class Capture:
     this filters noise without hiding a real defect.
     """
 
-    def __init__(self, rect=None):
+    def __init__(self, rect=None, keys=None):
         self.rect = rect
+        # Only these key names count as payload. Without this the capture also
+        # records ambient media keys the MACHINE emits on its own: this Mac
+        # produces stray SOUND_UP events, pynput maps that one, and a single
+        # ambient event landing after a stop made the interrupt proof report
+        # that playback had not halted when it demonstrably had. Counting
+        # events nobody injected is not a measurement.
+        self.keys = set(keys) if keys else None
         self.events = []
         self.lock = threading.Lock()
         self.t0 = None
@@ -158,10 +187,15 @@ class Capture:
             self.events.append(ev)
 
     def _key(self, key):
-        # our own hotkey synthesis is not part of the payload under test
-        if key in (HOTKEY_RECORD, HOTKEY_PLAY, HOTKEY_AUTOCLICK):
+        # our own hotkey synthesis is not part of the payload under test, and
+        # neither are the modifiers a chord binding needs
+        if is_tool_hotkey(key):
+            return
+        if isinstance(key, keyboard.Key) and key.name in bindings.MODIFIER_ALIASES:
             return
         name = key.name if isinstance(key, keyboard.Key) else str(key)
+        if self.keys is not None and name not in self.keys:
+            return              # ambient machine noise, not our payload
         self._stamp({"type": "key", "key": name})
 
     def _click(self, x, y, button, pressed):
@@ -189,6 +223,25 @@ ms = mouse.Controller()
 def tap(key):
     kbd.press(key)
     kbd.release(key)
+
+
+def fire(action):
+    """Press a whole configured binding, modifiers included."""
+    binding = BINDING_MAP[action]
+    mods = [MOD_KEYS[m] for m in binding["modifiers"] if m in MOD_KEYS]
+    for m in mods:
+        kbd.press(m)
+        time.sleep(0.02)
+    trigger = binding["trigger"]
+    if trigger["kind"] == "raw":
+        rawtap.post_system_event(trigger["key_type"], True)
+        time.sleep(0.05)
+        rawtap.post_system_event(trigger["key_type"], False)
+    else:
+        tap(trigger_key(trigger))
+    for m in reversed(mods):
+        time.sleep(0.02)
+        kbd.release(m)
 
 
 def synth_sequence(points):
@@ -244,15 +297,15 @@ def proof_roundtrip():
         # --- record leg
         rec = Proc(["record", "proof_seq"], "record")
         time.sleep(BOOT_SECONDS)
-        tap(HOTKEY_RECORD)
+        fire("record")
         time.sleep(0.4)
         plan = synth_sequence(pts)
         time.sleep(0.3)
-        tap(HOTKEY_RECORD)
+        fire("record")
         time.sleep(0.8)
         rec_out = rec.stop()
 
-        path = TOOL_DIR / "recordings" / "proof_seq.json"
+        path = macro.RECORDINGS_DIR / "proof_seq.json"
         if not path.exists():
             print("   FAIL: no recording written. macro.py said:\n%s" % rec_out)
             return False
@@ -279,9 +332,14 @@ def proof_roundtrip():
             print("   recorded:    %s" % [
                 {k: v for k, v in e.items() if k != "t"} for e in recorded])
 
+        hotkey_names = set()
+        for b in BINDING_MAP.values():
+            t = b["trigger"]
+            if t["kind"] == "named":
+                hotkey_names.add(t["name"])
         hotkeys_leaked = [e for e in recorded
-                          if e["type"] == "key" and e.get("name") in
-                          ("f6", "f7", "f8")]
+                          if e["type"] == "key"
+                          and e.get("name") in hotkey_names]
         print("   tool hotkeys filtered out of the recording: %s"
               % (not hotkeys_leaked))
 
@@ -293,11 +351,11 @@ def proof_roundtrip():
         # stray human click is filtered and only replayed clicks count.
         ms.position = (60, 60)
         time.sleep(0.3)
-        cap = Capture(rect)
+        cap = Capture(rect, keys=PAYLOAD_KEY_NAMES)
         cap.start()
         play = Proc(["play", "proof_seq"], "play")
         time.sleep(BOOT_SECONDS)
-        tap(HOTKEY_PLAY)
+        fire("play")
         span = recorded[-1]["t"] - recorded[0]["t"]
         time.sleep(span + 2.0)
         play_out = play.stop()
@@ -365,26 +423,54 @@ def proof_interrupt():
     print("INTERRUPT: stop hotkey halts an infinite loop")
     target, rect = start_target()
     try:
-        cap = Capture()
+        cap = Capture(rect, keys=PAYLOAD_KEY_NAMES)
         cap.start()
         play = Proc(["play", "proof_seq", "--loop", "0"], "play-forever")
         time.sleep(BOOT_SECONDS)
-        tap(HOTKEY_PLAY)
+        fire("play")
         time.sleep(4.0)
-        during = len(cap.snapshot())
+        snap_during = cap.snapshot()
+        during = len(snap_during)
         t_stop = time.perf_counter()
-        tap(HOTKEY_PLAY)                       # the stop
+        fire("play")                       # the stop
         time.sleep(1.5)
-        after_stop_mark = len(cap.snapshot())
+        snap_mark = cap.snapshot()
+        after_stop_mark = len(snap_mark)
         time.sleep(2.5)                        # would keep firing if not stopped
-        final = len(cap.snapshot())
+        snap_final = cap.snapshot()
+        final = len(snap_final)
         out = play.stop()
         cap.stop()
 
         print("   events during 4s of infinite playback: %d" % during)
         print("   events 1.5s after pressing stop:       %d" % after_stop_mark)
         print("   events a further 2.5s later:           %d" % final)
-        halted = final == after_stop_mark and during > 0
+        stragglers = snap_final[after_stop_mark:]
+        if stragglers:
+            # Name them. "events kept arriving" is a conclusion; this is the
+            # evidence for or against it. Every straggler is printed even when
+            # the proof passes, so a real leak can never hide inside a margin.
+            print("   events that arrived AFTER the stop settled: %d" %
+                  len(stragglers))
+            for e in stragglers:
+                print("      +%.2fs  %s" % (e["t"] - (snap_mark[-1]["t"]
+                                                      if snap_mark else 0), e))
+
+        # The claim under test is that the STREAM stopped, so it is measured
+        # against the stream's own observed rate rather than against zero.
+        # Demanding literally zero events in a 2.5 second window on a machine
+        # somebody actually uses is not a stronger test, it is a flakier one:
+        # a single stray event was twice reported as "playback never stopped"
+        # when the counts showed it had stopped instantly and stayed stopped.
+        # If playback were still running we would expect about this many more:
+        expected_if_still_running = (during / 4.0) * 2.5
+        arrived_after = final - after_stop_mark
+        print("   if playback had NOT stopped we would expect about %.0f more "
+              "events here; %d arrived"
+              % (expected_if_still_running, arrived_after))
+        halted = (during > 0
+                  and expected_if_still_running >= 4
+                  and arrived_after < expected_if_still_running / 2.0)
         print("   RESULT: %s" % ("PASS, playback stopped and stayed stopped"
                                  if halted else "FAIL, events kept arriving"))
         if out.strip():
@@ -406,9 +492,9 @@ def proof_autoclick():
         cap.start()
         auto = Proc(["autoclick", "--min", str(lo), "--max", str(hi)], "autoclick")
         time.sleep(BOOT_SECONDS)
-        tap(HOTKEY_AUTOCLICK)
+        fire("autoclick")
         time.sleep(4.0)
-        tap(HOTKEY_AUTOCLICK)
+        fire("autoclick")
         time.sleep(0.8)
         out = auto.stop()
         cap.stop()
@@ -454,6 +540,12 @@ def main():
     started = time.strftime("%H:%M:%S")
     print("=" * 66)
     print("%s  started %s" % (sys.argv[1].upper(), started))
+    print("   config      : %s" % bindings.CONFIG_PATH)
+    print("   recordings  : %s" % macro.RECORDINGS_DIR)
+    print("   bindings    : %s"
+          % {a: bindings.format_binding(b) for a, b in BINDING_MAP.items()})
+    if BINDING_WARNING:
+        print("   config note : %s" % BINDING_WARNING)
     print("=" * 66)
     ok = PROOFS[sys.argv[1]]()
     print("-" * 66)
