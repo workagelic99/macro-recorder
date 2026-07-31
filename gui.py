@@ -44,6 +44,10 @@ W, H = 580, 700
 # How long a Test Input prompt listens before it reports that nothing arrived.
 TEST_INPUT_SECONDS = 8.0
 
+# How long a flashed message holds the status line before the tool's own state
+# description takes it back.
+NOTICE_SECONDS = 6.0
+
 ACTION_TITLES = {"record": "Record", "play": "Play", "autoclick": "Autoclick"}
 
 
@@ -111,6 +115,11 @@ class MacroWindow(NSObject):
         self.test_seq = 0
         self.test_started = 0.0
         self.test_decided = False
+        # which recording Delete is currently armed on, main thread only
+        self.pending_delete = None
+        # a flashed message and when it expires, main thread only
+        self.notice = None
+        self.notice_until = 0.0
         self.build()
         return self
 
@@ -126,6 +135,19 @@ class MacroWindow(NSObject):
         view = self.window.contentView()
 
         view.addSubview_(label("Recordings", 16, H - 34, 120, 18, bold=True))
+
+        # Delete sits with the list it acts on, not down with the transport
+        # buttons, so it reads as list management rather than as a fourth way
+        # to stop something. It confirms in two presses instead of throwing up
+        # a modal: the same arm-then-confirm shape the Hotkeys rows already
+        # use, and the armed button says out loud which recording it means.
+        self.btn_delete = button("Delete", W - 190, H - 38, 174, self,
+                                 self.onDelete_, h=24)
+        self.btn_delete_cancel = button("Cancel", W - 284, H - 38, 86, self,
+                                        self.onDeleteCancel_, h=24)
+        self.btn_delete_cancel.setEnabled_(False)
+        view.addSubview_(self.btn_delete)
+        view.addSubview_(self.btn_delete_cancel)
 
         # recordings table
         scroll = NSScrollView.alloc().initWithFrame_(
@@ -148,10 +170,11 @@ class MacroWindow(NSObject):
         self.name_field = field("my_sequence", 78, y, 150)
         view.addSubview_(self.name_field)
         self.btn_record = button("Record (%s)" % tool_label(self.tool, "record"),
-                                 232, y - 4, 122, self, self.onRecord_)
-        self.btn_stop = button("Stop", 360, y - 4, 74, self, self.onStop_)
+                                 232, y - 4, 116, self, self.onRecord_)
+        # wide enough for "Stop & Save", which it becomes while recording
+        self.btn_stop = button("Stop", 354, y - 4, 100, self, self.onStop_)
         self.btn_play = button("Play (%s)" % tool_label(self.tool, "play"),
-                               440, y - 4, 104, self, self.onPlay_)
+                               460, y - 4, 104, self, self.onPlay_)
         for b in (self.btn_record, self.btn_stop, self.btn_play):
             view.addSubview_(b)
 
@@ -278,7 +301,20 @@ class MacroWindow(NSObject):
 
     @objc.python_method
     def flash(self, message):
+        """
+        Say something to the user NOW, whatever the tool is doing.
+
+        tool.status() describes the tool's state, and while it is playing or
+        recording that description wins, which used to mean a refusal was
+        written somewhere nobody could see it: press Delete during playback and
+        the reason went straight into last_message under a status line still
+        cheerfully reporting the loop count. A refusal the user cannot read is
+        the same as a button that silently does nothing. So a flashed message
+        takes the status line for a few seconds and then hands it back.
+        """
         self.tool.last_message = message
+        self.notice = message
+        self.notice_until = time.monotonic() + NOTICE_SECONDS
 
     @objc.python_method
     def sync_loop_field(self):
@@ -341,6 +377,62 @@ class MacroWindow(NSObject):
 
     def onForever_(self, sender):
         self.sync_loop_field()
+
+    # ---------- deleting a recording, two presses, main thread only
+
+    @objc.python_method
+    def disarm_delete(self, message=None):
+        self.pending_delete = None
+        self.btn_delete.setTitle_("Delete")
+        self.btn_delete_cancel.setEnabled_(False)
+        if message:
+            self.flash(message)
+
+    @objc.python_method
+    def arm_delete(self, name):
+        self.pending_delete = name
+        shown = name if len(name) <= 18 else name[:17] + "..."
+        self.btn_delete.setTitle_("Delete '%s'?" % shown)
+        self.btn_delete_cancel.setEnabled_(True)
+        self.flash("Delete '%s' permanently? This cannot be undone. Press "
+                   "Delete again to confirm, or Cancel to keep it." % name)
+
+    def onDelete_(self, sender):
+        # Refuse while something is running. Deleting the file out from under
+        # a playback that is reading it would be a confusing way to fail, and
+        # the recording being written right now is the one most worth keeping.
+        if self.tool.state != "idle":
+            self.disarm_delete()
+            self.flash("Cannot delete while the tool is busy. Press Stop "
+                       "first, then delete.")
+            return
+        selected = self.selected_name()
+        if not selected:
+            self.disarm_delete()
+            self.flash("Pick a recording in the list first, then press "
+                       "Delete.")
+            return
+        if self.pending_delete != selected:
+            # first press, or the selection moved since it was armed
+            self.arm_delete(selected)
+            return
+        name = self.pending_delete
+        try:
+            path = macro.delete_recording(name)
+        except Exception as exc:
+            self.disarm_delete()
+            self.refresh_list()
+            self.flash("Could not delete '%s': %s" % (name, exc))
+            return
+        self.disarm_delete()
+        self.refresh_list()
+        self.flash("Deleted '%s'." % path.stem)
+
+    def onDeleteCancel_(self, sender):
+        if self.pending_delete is None:
+            return
+        self.disarm_delete("Kept '%s'. Nothing was deleted."
+                           % self.pending_delete)
 
     # ---------- hotkeys editor, all on the main thread
 
@@ -582,11 +674,32 @@ class MacroWindow(NSObject):
                 self.finish_capture(taken[0], taken[1])
         self.update_test_input()
         state = self.tool.state
-        self.status.setStringValue_(self.tool.status())
+        # An armed Delete must not survive the thing it was aimed at moving.
+        # Disarming on a selection change or on the tool going busy means the
+        # second press can never land on a recording the user did not mean.
+        if self.pending_delete is not None:
+            if state != "idle" or self.selected_name() != self.pending_delete:
+                self.disarm_delete()
+        if self.notice is not None and time.monotonic() < self.notice_until:
+            self.status.setStringValue_(self.notice)
+        else:
+            self.notice = None
+            self.status.setStringValue_(self.tool.status())
         busy = state != "idle"
         self.btn_record.setEnabled_(not busy)
         self.btn_play.setEnabled_(not busy)
         self.btn_stop.setEnabled_(busy)
+        # Delete stays ENABLED while the tool is busy on purpose. Greying it
+        # out would refuse the press silently, and a control that does nothing
+        # without saying why is the thing this project keeps getting bitten by.
+        # The handler refuses and puts the reason on the status line instead.
+        # Say what Stop actually does. Stopping a recording writes it to disk
+        # under the Save as name, which is the one thing a first-time user has
+        # no way of guessing from a button called Stop. Stopping a playback or
+        # the autoclicker saves nothing, so the label only makes the promise
+        # while it is true.
+        self.btn_stop.setTitle_("Stop & Save" if state == "recording"
+                                else "Stop")
         label = tool_label(self.tool, "autoclick")
         self.btn_auto.setTitle_(("Stop (%s)" if state == "autoclicking"
                                  else "Start (%s)") % label)

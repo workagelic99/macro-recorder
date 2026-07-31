@@ -84,14 +84,29 @@ Or just **double click `Macro Recorder.command`** in Finder. That opens a small 
 
 You get one window with everything in it:
 
-- A list of your saved recordings
-- A **Save as** box, and **Record**, **Stop** and **Play** buttons
+- A list of your saved recordings, with a **Delete** button beside it
+- A **Save as** box, and **Record**, **Stop** and **Play** buttons. While you are recording, Stop reads **Stop & Save**, because that is exactly what it does: it ends the recording and writes it to disk under whatever is in the Save as box. You never have to hunt for a separate save step, and there is not one.
 - A **Speed** box and a **Repeat** box, plus a **Loop forever** tickbox
 - An **Autoclicker** section with **Min ms** and **Max ms** boxes and a start and stop button
 - A **Hotkeys** panel where you change the three shortcuts, plus a **Test Input** button that tells you whether a key is reaching the tool at all
 - A **status line** along the bottom that always says exactly what is happening, for example `Playing 'farm_loop': loop 3 of 10`
 
 The hotkeys below keep working while the window is open, so you can leave it off to one side and drive everything from the keyboard. The window stays responsive while a macro is playing.
+
+### Deleting a recording
+
+Click the one you want in the list, then press **Delete**. It asks before it does anything:
+
+1. The button changes to **Delete 'that_name'?** and the status line spells out which recording it means and that this cannot be undone
+2. Press **Delete** again to go through with it, or press **Cancel** to keep it
+
+Only the recording you selected is ever touched, and its file is removed from the `recordings/` folder. There is no undo and nothing goes to the Trash, which is why it asks twice.
+
+Three things it deliberately refuses to do, each with the reason on the status line rather than a button that just sits there:
+
+- Nothing selected: it tells you to pick a recording first.
+- Something is recording or playing: it tells you to press Stop first. Deleting a file while it is being played back is a confusing way to fail, and the recording being written right now is the one most worth keeping.
+- If you click a different recording while it is asking, it forgets the question. The second press can never land on something you did not aim at.
 
 ## The hotkeys
 
@@ -271,6 +286,7 @@ Every test runs against a **throwaway recordings directory and a throwaway confi
 ./.venv/bin/python tests/gate_a.py i
 ./.venv/bin/python tests/gate_a.py ii
 ./.venv/bin/python tests/gate_a.py iii
+./.venv/bin/python tests/delete_gate.py
 ./.venv/bin/python tests/regression_matrix.py
 ```
 
@@ -279,6 +295,7 @@ What the less obvious ones are for:
 - `gate_a.py` starts every action by sending a real key through the OS and letting it come back via the listener. It never calls a button handler to start an action, because a proof that presses the button cannot tell you whether the hotkey works. Case `iii` edits bindings through the actual Set buttons, saves, and then fires the edited keys.
 - `chord_nonmatch.py` covers the awkward half of combination hotkeys: a modifier arrives before the tool can know whether a hotkey is coming, so it is held back and then either dropped or put back into your recording at its original time.
 - `config_matrix.py` gives nine different broken config files to a fresh window and a fresh command line each, and forces a save to fail at the exact moment the replacement happens.
+- `delete_gate.py` is the strictest proof here, because deleting is the only thing this tool does that destroys something. Every press goes through the real button and every claim is checked against the disk: arming deletes nothing, Cancel deletes nothing, confirming removes exactly the named file while every other recording is checksummed before and after.
 - `regression_matrix.py` runs everything above three times over: with no config, with saved plain keys, and with saved combinations.
 
 ## Licence

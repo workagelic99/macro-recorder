@@ -195,6 +195,26 @@ def valid_name(name):
     return bool(NAME_RE.match(name or ""))
 
 
+def delete_recording(name):
+    """
+    Remove one saved recording and return the path that went.
+
+    Lives here rather than in the window because the window is a front end
+    over this engine and does not get its own copy of file handling. The name
+    is validated first for the same reason it is validated on save: a name
+    carrying a slash or a .. would reach outside the recordings directory, and
+    this is the one operation where that would destroy something.
+    """
+    if not valid_name(name):
+        raise ValueError("that name is not allowed")
+    path = RECORDINGS_DIR / (name + ".json")
+    if not path.exists():
+        raise FileNotFoundError("no recording named '%s' in %s"
+                                % (name, RECORDINGS_DIR))
+    path.unlink()
+    return path
+
+
 # --- the engine -------------------------------------------------------------
 
 class MacroTool:
